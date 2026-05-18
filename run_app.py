@@ -97,6 +97,7 @@ def main():
             "--server.port", str(PORT),
             "--server.address", "127.0.0.1",
             "--server.headless", "true",
+            "--global.developmentMode", "false",
             "--browser.gatherUsageStats", "false",
             "--server.enableXsrfProtection", "false",
             "--server.fileWatcherType", "none",
