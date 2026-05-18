@@ -17,7 +17,8 @@ from models.audit_result import AuditStatus
 from engine.auditor import Auditor
 from engine.batch_context import build_batch_context
 from engine.calculator import compute_fas_concentration, compute_blank_average, recompute_all_cod
-from parsers.excel_parser import parse_excel, build_demo_record
+from parsers.excel_parser import build_demo_record
+from parsers import parse as parse_file
 
 # ============================================================
 # 页面配置
@@ -133,8 +134,8 @@ def page_home():
 
         st.markdown("### 上传原始记录文件")
         uploaded = st.file_uploader(
-            "支持 Excel (.xls/.xlsx) 格式",
-            type=["xls", "xlsx"],
+            "支持 Excel / PDF / DOCX / 图片 格式",
+            type=["xls", "xlsx", "pdf", "docx", "png", "jpg", "jpeg"],
             key="home_upload",
         )
         if uploaded is not None:
@@ -168,8 +169,8 @@ def page_upload():
     with col1:
         st.markdown("### 上传原始记录文件")
         uploaded = st.file_uploader(
-            "支持 Excel (.xls/.xlsx) 格式",
-            type=["xls", "xlsx"],
+            "支持 Excel / PDF / DOCX / 图片 格式",
+            type=["xls", "xlsx", "pdf", "docx", "png", "jpg", "jpeg"],
             key="upload_page",
         )
         if uploaded is not None:
@@ -192,31 +193,123 @@ def page_upload():
 
 
 def _handle_upload(uploaded):
-    """处理上传文件"""
-    suffix = Path(uploaded.name).suffix.lower()
-    if suffix not in ('.xls', '.xlsx'):
-        st.error(f"暂不支持 {suffix} 格式，请上传 .xls 或 .xlsx 文件")
-        return
+    """处理上传文件 — 多格式支持 + 可选 AI fallback"""
+    from parsers.ai_mapper import AIFieldMapper
 
     with st.spinner(f"正在解析 {uploaded.name}..."):
-        tmp_path = Path("/tmp") / uploaded.name
-        tmp_path.write_bytes(uploaded.getvalue())
-        try:
-            record = parse_excel(str(tmp_path))
-            st.session_state.record = record
-            st.session_state.report = None
-            st.session_state.parsed_file_name = uploaded.name
-            st.success(f"解析成功！提取到 {len(record.samples)} 条样品记录")
-            st.rerun()
-        except Exception as e:
-            st.error(f"文件解析失败: {e}")
-            # 回退: 使用示例数据
+        result = parse_file(uploaded.getvalue(), uploaded.name)
+
+        if not result.ok:
+            st.error(f"文件解析失败: {'; '.join(result.warnings)}")
             st.info("已自动加载示例数据进行演示")
             st.session_state.record = build_demo_record()
             st.session_state.parsed_file_name = f"{uploaded.name} (解析失败，使用示例数据)"
+            return
+
+        rec = result.record
+        warnings = result.warnings
+
+        # AI fallback for missing fields
+        use_ai = st.checkbox(
+            "AI 辅助补全缺失字段",
+            value=False,
+            help="当启发式解析无法提取全部字段时，使用 AI 从原始文本中补全",
+            key=f"ai_{uploaded.name}",
+        )
+        if use_ai and warnings:
+            ai_api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            mapper = AIFieldMapper(api_key=ai_api_key)
+            if mapper.available:
+                with st.spinner("AI 正在补全缺失字段..."):
+                    # Re-extract raw text for AI
+                    raw_text = _get_raw_text(uploaded)
+                    rec, changed = mapper.fill_gaps(raw_text, rec)
+                    if changed:
+                        st.success("AI 已补全部分字段")
+                    else:
+                        st.info("AI 未找到可补全的字段")
+            else:
+                st.warning("未配置 ANTHROPIC_API_KEY，无法使用 AI 功能")
+
+        st.session_state.record = rec
+        st.session_state.report = None
+        st.session_state.parsed_file_name = uploaded.name
+
+        msg = f"解析成功！提取到 {len(rec.samples)} 条样品记录（{result.source_format} 格式）"
+        if result.used_ai_fallback:
+            msg += " | AI 辅助提取"
+        if warnings:
+            msg += f" | {len(warnings)} 个警告"
+        st.success(msg)
+        if warnings:
+            for w in warnings[:3]:
+                st.warning(w)
+        st.rerun()
+
+
+def _get_raw_text(uploaded) -> str:
+    """从上传文件获取原始文本 (供 AI mapper 使用)"""
+    ext = uploaded.name.rsplit('.', 1)[-1].lower() if '.' in uploaded.name else ''
+    file_bytes = uploaded.getvalue()
+
+    if ext == 'pdf':
+        import fitz
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        try:
+            return '\n'.join(doc[i].get_text("text") for i in range(doc.page_count))
         finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            doc.close()
+    elif ext in ('xls', 'xlsx'):
+        return _read_excel_text(file_bytes, ext)
+    elif ext == 'docx':
+        from docx import Document
+        from io import BytesIO
+        doc = Document(BytesIO(file_bytes))
+        lines = []
+        for table in doc.tables:
+            for row in table.rows:
+                lines.extend(cell.text for cell in row.cells)
+        return '\n'.join(lines)
+    elif ext in ('png', 'jpg', 'jpeg'):
+        import numpy as np
+        from PIL import Image
+        from io import BytesIO
+        try:
+            import easyocr
+            reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+            img = Image.open(BytesIO(file_bytes))
+            if img.mode in ('RGBA', 'L'):
+                img = img.convert('RGB')
+            results = reader.readtext(np.array(img))
+            results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+            return '\n'.join(text for (_bbox, text, _conf) in results if text.strip())
+        except ImportError:
+            return ""
+    return ""
+
+
+def _read_excel_text(file_bytes: bytes, ext: str) -> str:
+    """读取 Excel 文件原始文本"""
+    from io import BytesIO
+    lines = []
+    if ext == 'xls':
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=file_bytes)
+        for sheet in wb.sheets():
+            for row in range(sheet.nrows):
+                row_text = ' '.join(
+                    str(sheet.cell_value(row, col)) for col in range(sheet.ncols)
+                )
+                lines.append(row_text)
+    else:
+        import openpyxl
+        wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                row_text = ' '.join(str(c) if c is not None else '' for c in row)
+                if row_text.strip():
+                    lines.append(row_text)
+    return '\n'.join(lines)
 
 
 def _render_record_overview(rec: CODRecord):
