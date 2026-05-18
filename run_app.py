@@ -8,28 +8,31 @@ import os
 import sys
 import subprocess
 import webbrowser
-import threading
+import socket
 import time
 
 
 def find_app_path() -> str:
-    """在 exe 同目录或 _internal 目录下查找 app.py"""
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-
-    # 先在同目录找
     app = os.path.join(base, "app.py")
     if os.path.exists(app):
         return app
-
-    # 再在 _internal 找
     app = os.path.join(base, "_internal", "app.py")
     if os.path.exists(app):
         return app
-
     return ""
+
+
+def port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
 
 
 def main():
@@ -42,16 +45,13 @@ def main():
     port = 8501
     url = f"http://localhost:{port}"
 
-    # 后台打开浏览器
-    def _open_browser():
-        time.sleep(3)
+    if port_in_use(port):
+        print("Streamlit 已在运行，直接打开浏览器...")
         webbrowser.open(url)
+        return
 
-    threading.Thread(target=_open_browser, daemon=True).start()
-
-    print(f"COD 审核系统启动中...")
+    print("COD 审核系统启动中...")
     print(f"浏览器打开 {url} 即可使用")
-    print(f"按 Ctrl+C 停止服务")
 
     cmd = [
         sys.executable, "-m", "streamlit", "run", app_path,
@@ -62,7 +62,10 @@ def main():
         "--server.fileWatcherType", "none",
     ]
 
-    subprocess.run(cmd)
+    p = subprocess.Popen(cmd)
+    time.sleep(3)
+    webbrowser.open(url)
+    p.wait()
 
 
 if __name__ == "__main__":
